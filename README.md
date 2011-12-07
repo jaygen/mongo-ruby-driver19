@@ -37,10 +37,10 @@ for much more:
 
 ### Ruby Versions
 
-The driver works and is consistently tested on Ruby 1.8.6, 1.8.7, and 1.9.2, and JRuby 1.5.1.
+The driver works and is consistently tested on Ruby ~~1.8.6, 1.8.7, and~~ 1.9.2, and JRuby 1.5.1.
 
-Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There
-are some IO bugs in earlier versions.
+~~Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There
+are some IO bugs in earlier versions.~~
 
 ### Gems
 
@@ -161,7 +161,7 @@ Ruby 1.9 has built-in character encoding support. All strings sent to Mongo
 and received from Mongo are converted to UTF-8 when necessary, and strings
 read from Mongo will have their character encodings set to UTF-8.
 
-When used with Ruby 1.8, the bytes in each string are written to and read from
+When used with ~~Ruby 1.8~~, the bytes in each string are written to and read from
 Mongo as is. If the string is ASCII, all is well, because ASCII is a subset of
 UTF-8. If the string is not ASCII, it may not be a well-formed UTF-8
 string.
