@@ -212,7 +212,7 @@ module BSON
       end
       @buf.rewind
       @buf.get_int                # eat message size
-      doc = BSON::OrderedHash.new
+      doc = Hash.new
       while @buf.more?
         type = @buf.get
         case type
