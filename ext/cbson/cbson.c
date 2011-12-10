@@ -868,7 +868,7 @@ static VALUE get_value(const char* buffer, int* position, int type) {
 }
 
 static VALUE elements_to_hash(const char* buffer, int max) {
-    VALUE hash = rb_class_new_instance(0, NULL, OrderedHash);
+    VALUE hash = rb_class_new_instance(0, NULL, RB_HASH);
     int position = 0;
     while (position < max) {
         int type = (int)buffer[position++];
