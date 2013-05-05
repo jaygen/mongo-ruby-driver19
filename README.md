@@ -67,16 +67,9 @@ puts "There are #{@coll.count} records. Here they are:"
 
 ### Ruby Versions
 
-<<<<<<< HEAD
-The driver works and is consistently tested on Ruby ~~1.8.6, 1.8.7, and~~ 1.9.2, and JRuby 1.5.1.
+The driver works and is consistently tested on ~~Ruby 1.8.7~~ 1.9.3 and 2.0.0 as well as JRuby 1.6.x and 1.7.x.
 
-~~Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There
-are some IO bugs in earlier versions.~~
-=======
-The driver works and is consistently tested on Ruby 1.8.7 and 1.9.3 as well as JRuby 1.6.x and 1.7.x.
-
-Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There are some IO bugs in earlier versions.
->>>>>>> 65cb4820262e2de95f04e31b45f65f18a70fd85e
+~~Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There are some IO bugs in earlier versions.~~
 
 ### Gems
 
