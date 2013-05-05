@@ -1,31 +1,24 @@
-# encoding: UTF-8
-#
-# --
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ++
-
-$:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
-
-require 'mongo/version'
-
 module Mongo
-  ASCENDING  =  1
-  DESCENDING = -1
-  GEO2D      = '2d'
+  ASCENDING   =  1
+  DESCENDING  = -1
+  GEO2D       = '2d'
+  GEO2DSPHERE = '2dsphere'
+  GEOHAYSTACK = 'geoHaystack'
+  TEXT        = 'text'
+  HASHED      = 'hashed'
+
+  INDEX_TYPES = {
+    'ASCENDING'   => ASCENDING,
+    'DESCENDING'  => DESCENDING,
+    'GEO2D'       => GEO2D,
+    'GEO2DSPHERE' => GEO2DSPHERE,
+    'GEOHAYSTACK' => GEOHAYSTACK,
+    'TEXT'        => TEXT,
+    'HASHED'      => HASHED
+  }
 
   DEFAULT_MAX_BSON_SIZE = 4 * 1024 * 1024
+  MESSAGE_SIZE_FACTOR = 2
 
   module Constants
     OP_REPLY        = 1
@@ -53,31 +46,35 @@ end
 
 require 'bson'
 
+require 'mongo/util/thread_local_variable_manager'
 require 'mongo/util/conversions'
 require 'mongo/util/support'
+require 'mongo/util/read_preference'
+require 'mongo/util/write_concern'
 require 'mongo/util/core_ext'
 require 'mongo/util/logging'
 require 'mongo/util/node'
 require 'mongo/util/pool'
 require 'mongo/util/pool_manager'
+require 'mongo/util/sharding_pool_manager'
 require 'mongo/util/server_version'
+require 'mongo/util/socket_util'
 require 'mongo/util/ssl_socket'
+require 'mongo/util/tcp_socket'
+require 'mongo/util/unix_socket'
 require 'mongo/util/uri_parser'
 
-require 'mongo/collection'
+
 require 'mongo/networking'
-require 'mongo/connection'
-require 'mongo/repl_set_connection'
+require 'mongo/mongo_client'
+require 'mongo/mongo_replica_set_client'
+require 'mongo/mongo_sharded_client'
+require 'mongo/legacy'
+require 'mongo/collection'
 require 'mongo/cursor'
 require 'mongo/db'
 require 'mongo/exceptions'
 require 'mongo/gridfs/grid_ext'
 require 'mongo/gridfs/grid'
 require 'mongo/gridfs/grid_io'
-if RUBY_PLATFORM =~ /java/
-  require 'mongo/gridfs/grid_io_fix'
-end
 require 'mongo/gridfs/grid_file_system'
-
-require 'timeout'
-Mongo::TimeoutHandler = Timeout

@@ -1,27 +1,27 @@
-# encoding: UTF-8
-
-# --
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ++
-
 require 'digest/md5'
 
 module Mongo
   module Support
+
     include Mongo::Conversions
     extend self
+
+    # Commands that may be sent to replica-set secondaries, depending on
+    # read preference and tags. All other commands are always run on the primary.
+    SECONDARY_OK_COMMANDS = [
+      'group',
+      'aggregate',
+      'collstats',
+      'dbstats',
+      'count',
+      'distinct',
+      'geonear',
+      'geosearch',
+      'geowalk',
+      'mapreduce',
+      'replsetgetstatus',
+      'ismaster',
+    ]
 
     # Generate an MD5 for authentication.
     #
@@ -58,23 +58,46 @@ module Mongo
       db_name
     end
 
-    def validate_read_preference(value)
-      if [:primary, :secondary, nil].include?(value)
-        return true
+    def secondary_ok?(selector)
+      command = selector.keys.first.to_s.downcase
+
+      if command == 'mapreduce'
+        out = selector.select { |k, v| k.to_s.downcase == 'out' }.first.last
+        # mongo looks at the first key in the out object, and doesn't
+        # look at the value
+        out.is_a?(Hash) && out.keys.first.to_s.downcase == 'inline' ? true : false
       else
-        raise MongoArgumentError, "#{value} is not a valid read preference. " +
-          "Please specify either :primary or :secondary."
+        SECONDARY_OK_COMMANDS.member?(command)
       end
     end
 
     def format_order_clause(order)
       case order
+        when Hash, BSON::OrderedHash then hash_as_sort_parameters(order)
         when String, Symbol then string_as_sort_parameters(order)
         when Array then array_as_sort_parameters(order)
         else
           raise InvalidSortValueError, "Illegal sort clause, '#{order.class.name}'; must be of the form " +
             "[['field1', '(ascending|descending)'], ['field2', '(ascending|descending)']]"
       end
+    end
+
+    def normalize_seeds(seeds)
+      pairs = Array(seeds)
+      pairs = [ seeds ] if pairs.last.is_a?(Fixnum)
+      pairs = pairs.collect do |hostport|
+        if hostport.is_a?(String)
+          host, port = hostport.split(':')
+          [ host, port && port.to_i || MongoClient::DEFAULT_PORT ]
+        else
+          hostport
+        end
+      end
+      pairs.length > 1 ? pairs : pairs.first
+    end
+
+    def is_i?(value)
+      return !!(value =~ /^\d+$/)
     end
 
     # Determine if a database command has succeeded by

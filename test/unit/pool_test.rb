@@ -1,4 +1,4 @@
-require './test/test_helper'
+require 'test_helper'
 include Mongo
 
 class PoolTest < Test::Unit::TestCase

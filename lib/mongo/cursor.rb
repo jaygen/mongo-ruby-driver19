@@ -1,19 +1,3 @@
-# encoding: UTF-8
-
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 module Mongo
 
   # A cursor over query results. Returned objects are hashes.
@@ -22,11 +6,13 @@ module Mongo
     include Mongo::Constants
     include Mongo::Conversions
     include Mongo::Logging
+    include Mongo::ReadPreference
 
     attr_reader :collection, :selector, :fields,
       :order, :hint, :snapshot, :timeout,
       :full_collection_name, :transformer,
-      :options, :cursor_id, :show_disk_loc
+      :options, :cursor_id, :show_disk_loc,
+      :comment, :read, :tag_sets, :acceptable_latency
 
     # Create a new cursor.
     #
@@ -38,7 +24,6 @@ module Mongo
     # @core cursors constructor_details
     def initialize(collection, opts={})
       @cursor_id  = nil
-
       @db         = collection.db
       @collection = collection
       @connection = @db.connection
@@ -55,6 +40,7 @@ module Mongo
       @max_scan   = opts.fetch(:max_scan, nil)
       @return_key = opts.fetch(:return_key, nil)
       @show_disk_loc = opts.fetch(:show_disk_loc, nil)
+      @comment    = opts[:comment]
 
       # Wire-protocol settings
       @fields     = convert_fields_for_query(opts[:fields])
@@ -65,18 +51,18 @@ module Mongo
       @options    = 0
 
       # Use this socket for the query
-      @socket     = opts[:socket]
+      @socket = opts[:socket]
+      @pool   = nil
 
       @closed       = false
       @query_run    = false
 
       @transformer = opts[:transformer]
-      if value = opts[:read]
-        Mongo::Support.validate_read_preference(value)
-      else
-        value = collection.read_preference
-      end
-      @read_preference = value.is_a?(Hash) ? value.dup : value
+      @read =  opts[:read] || @collection.read
+      Mongo::ReadPreference::validate(@read)
+      @tag_sets = opts[:tag_sets] || @collection.tag_sets
+      @acceptable_latency = opts[:acceptable_latency] || @collection.acceptable_latency
+
       batch_size(opts[:batch_size] || 0)
 
       @full_collection_name = "#{@collection.db.name}.#{@collection.name}"
@@ -86,7 +72,7 @@ module Mongo
       if(!@timeout)
         add_option(OP_QUERY_NO_CURSOR_TIMEOUT)
       end
-      if(@read_preference != :primary)
+      if(@read != :primary)
         add_option(OP_QUERY_SLAVE_OK)
       end
       if(@tailable)
@@ -98,10 +84,6 @@ module Mongo
       else
         @command = false
       end
-
-      @checkin_read_pool = false
-      @checkin_connection = false
-      @read_pool = nil
     end
 
     # Guess whether the cursor is alive on the server.
@@ -188,7 +170,7 @@ module Mongo
 
       command.merge!(BSON::OrderedHash["fields", @fields])
 
-      response = @db.command(command)
+      response = @db.command(command, :read => @read, :comment => @comment)
       return response['n'].to_i if Mongo::Support.ok?(response)
       return 0 if response['errmsg'] == "ns missing"
       raise OperationFailure.new("Count failed: #{response['errmsg']}", response['code'], response)
@@ -199,22 +181,18 @@ module Mongo
     # This method overrides any sort order specified in the Collection#find
     # method, and only the last sort applied has an effect.
     #
-    # @param [Symbol, Array] key_or_list either 1) a key to sort by or 2) 
-    #   an array of [key, direction] pairs to sort by. Direction should
-    #   be specified as Mongo::ASCENDING (or :ascending / :asc) or Mongo::DESCENDING (or :descending / :desc)
+    # @param [Symbol, Array, Hash, OrderedHash] order either 1) a key to sort by 2)
+    #   an array of [key, direction] pairs to sort by or 3) a hash of
+    #   field => direction pairs to sort by. Direction should be specified as
+    #   Mongo::ASCENDING (or :ascending / :asc) or Mongo::DESCENDING
+    #   (or :descending / :desc)
     #
     # @raise [InvalidOperation] if this cursor has already been used.
     #
     # @raise [InvalidSortValueError] if the specified order is invalid.
-    def sort(key_or_list, direction=nil)
+    def sort(order, direction=nil)
       check_modifiable
-
-      if !direction.nil?
-        order = [[key_or_list, direction]]
-      else
-        order = key_or_list
-      end
-
+      order = [[order, direction]] unless direction.nil?
       @order = order
       self
     end
@@ -232,7 +210,6 @@ module Mongo
     def limit(number_to_return=nil)
       return @limit unless number_to_return
       check_modifiable
-
       @limit = number_to_return
       self
     end
@@ -259,6 +236,9 @@ module Mongo
     # Note that the batch size will take effect only on queries
     # where the number to be returned is greater than 100.
     #
+    # This can not override MongoDB's limit on the amount of data it will
+    # return to the client. Depending on server version this can be 4-16mb.
+    #
     # @param [Integer] size either 0 or some integer greater than 1. If 0,
     #   the server will determine the batch size.
     #
@@ -276,7 +256,7 @@ module Mongo
     end
 
     # Iterate over each document in this cursor, yielding it to the given
-    # block.
+    # block, if provided. An Enumerator is returned if no block is given.
     #
     # Iterating over an entire cursor will close it.
     #
@@ -287,11 +267,18 @@ module Mongo
     #     puts doc['user']
     #   end
     def each
-      while doc = self.next
-        yield doc
+      if block_given? || !defined?(Enumerator)
+        while doc = self.next
+          yield doc
+        end
+      else
+        Enumerator.new do |yielder|
+          while doc = self.next
+            yielder.yield doc
+          end
+        end
       end
     end
-
     # Receive all the documents from this cursor as an array of hashes.
     #
     # Notes:
@@ -338,7 +325,11 @@ module Mongo
         message.put_int(1)
         message.put_long(@cursor_id)
         log(:debug, "Cursor#close #{@cursor_id}")
-        @connection.send_message(Mongo::Constants::OP_KILL_CURSORS, message, :connection => :reader)
+        @connection.send_message(
+          Mongo::Constants::OP_KILL_CURSORS,
+          message,
+          :pool => @pool
+        )
       end
       @cursor_id = 0
       @closed    = true
@@ -401,7 +392,8 @@ module Mongo
     #
     # @return [Hash]
     def query_options_hash
-      { :selector => @selector,
+      BSON::OrderedHash[
+        :selector => @selector,
         :fields   => @fields,
         :skip     => @skip,
         :limit    => @limit,
@@ -411,7 +403,8 @@ module Mongo
         :timeout  => @timeout,
         :max_scan => @max_scan,
         :return_key => @return_key,
-        :show_disk_loc => @show_disk_loc }
+        :show_disk_loc => @show_disk_loc,
+        :comment  => @comment ]
     end
 
     # Clean output for inspect.
@@ -461,20 +454,41 @@ module Mongo
       end
     end
 
+    # Sends initial query -- which is always a read unless it is a command
+    #
+    # Upon ConnectionFailure, tries query 3 times if socket was not provided
+    # and the query is either not a command or is a secondary_ok command.
+    #
+    # Pins pools upon successful read and unpins pool upon ConnectionFailure
+    #
     def send_initial_query
-      message = construct_query_message
-      payload = instrument_payload if @logger
-      sock    = @socket || checkout_socket_from_connection
-      instrument(:find, payload) do
+      tries = 0
+      instrument(:find, instrument_payload) do
         begin
-        results, @n_received, @cursor_id = @connection.receive_message(
-          Mongo::Constants::OP_QUERY, message, nil, sock, @command,
-          nil, @options & OP_QUERY_EXHAUST != 0)
-        rescue ConnectionFailure, OperationFailure, OperationTimeout => ex
-          force_checkin_socket(sock)
+          message = construct_query_message
+          socket = @socket || checkout_socket_from_connection
+          results, @n_received, @cursor_id = @connection.receive_message(
+            Mongo::Constants::OP_QUERY, message, nil, socket, @command,
+            nil, @options & OP_QUERY_EXHAUST != 0)
+        rescue ConnectionFailure => ex
+          socket.close if socket
+          @pool = nil
+          @connection.unpin_pool
+          @connection.refresh
+          if tries < 3 && !@socket && (!@command || Mongo::Support::secondary_ok?(@selector))
+            tries += 1
+            retry
+          else
+            raise ex
+          end
+        rescue OperationFailure, OperationTimeout => ex
           raise ex
+        ensure
+          socket.checkin unless @socket || socket.nil?
         end
-        checkin_socket(sock) unless @socket
+        if !@socket && !@command
+          @connection.pin_pool(socket.pool, read_preference)
+        end
         @returned += @n_received
         @cache += results
         @query_run = true
@@ -502,106 +516,51 @@ module Mongo
       # Cursor id.
       message.put_long(@cursor_id)
       log(:debug, "cursor.refresh() for cursor #{@cursor_id}") if @logger
-      sock = @socket || checkout_socket_for_op_get_more
+
+      socket = @pool.checkout
 
       begin
-      results, @n_received, @cursor_id = @connection.receive_message(
-        Mongo::Constants::OP_GET_MORE, message, nil, sock, @command, nil)
-      rescue ConnectionFailure, OperationFailure, OperationTimeout => ex
-        force_checkin_socket(sock)
-        raise ex
+        results, @n_received, @cursor_id = @connection.receive_message(
+          Mongo::Constants::OP_GET_MORE, message, nil, socket, @command, nil)
+      ensure
+        socket.checkin
       end
-      checkin_socket(sock) unless @socket
+
       @returned += @n_received
       @cache += results
       close_cursor_if_query_complete
     end
 
     def checkout_socket_from_connection
-      socket = nil
       begin
-        @checkin_connection = true
-        if @command || @read_preference == :primary
-          socket = @connection.checkout_writer
+        if @pool
+          socket = @pool.checkout
+        elsif @command && !Mongo::Support::secondary_ok?(@selector)
+          socket = @connection.checkout_reader({:mode => :primary})
         else
-          @read_pool = @connection.read_pool
-          socket = @connection.checkout_reader
+          socket = @connection.checkout_reader(read_preference)
         end
       rescue SystemStackError, NoMemoryError, SystemCallError => ex
         @connection.close
         raise ex
       end
-
+      @pool = socket.pool
       socket
     end
 
-    def checkout_socket_for_op_get_more
-      if @read_pool && (@read_pool != @connection.read_pool)
-        checkout_socket_from_read_pool
-      else
-        checkout_socket_from_connection
-      end
-    end
-
-    def checkout_socket_from_read_pool
-      new_pool = @connection.secondary_pools.detect do |pool|
-        pool.host == @read_pool.host && pool.port == @read_pool.port
-      end
-      if new_pool
-        sock = nil
-        begin
-          @read_pool = new_pool
-          sock = new_pool.checkout
-          @checkin_read_pool = true
-        rescue SystemStackError, NoMemoryError, SystemCallError => ex
-          @connection.close
-          raise ex
-        end
-        return sock
-      else
-        raise Mongo::OperationFailure, "Failure to continue iterating " +
-          "cursor because the the replica set member persisting this " +
-          "cursor at #{@read_pool.host_string} cannot be found."
-      end
-    end
-
     def checkin_socket(sock)
-      if @checkin_read_pool
-        @read_pool.checkin(sock)
-        @checkin_read_pool = false
-      elsif @checkin_connection
-        if @command || @read_preference == :primary
-          @connection.checkin_writer(sock)
-        else
-          @connection.checkin_reader(sock)
-        end
-        @checkin_connection = false
-      end
-    end
-
-    def force_checkin_socket(sock)
-      if @checkin_read_pool
-        @read_pool.checkin(sock)
-        @checkin_read_pool = false
-      else
-        if @command || @read_preference == :primary
-          @connection.checkin_writer(sock)
-        else
-          @connection.checkin_reader(sock)
-        end
-        @checkin_connection = false
-      end
+      @connection.checkin(sock)
     end
 
     def construct_query_message
-      message = BSON::ByteBuffer.new
+      message = BSON::ByteBuffer.new("", @connection.max_message_size)
       message.put_int(@options)
       BSON::BSON_RUBY.serialize_cstr(message, "#{@db.name}.#{@collection.name}")
       message.put_int(@skip)
-      message.put_int(@limit)
+      @batch_size > 1 ? message.put_int(@batch_size) : message.put_int(@limit)
       spec = query_contains_special_fields? ? construct_query_spec : @selector
-      message.put_binary(BSON::BSON_CODER.serialize(spec, false).to_s)
-      message.put_binary(BSON::BSON_CODER.serialize(@fields, false).to_s) if @fields
+      message.put_binary(BSON::BSON_CODER.serialize(spec, false, false, @connection.max_bson_size).to_s)
+      message.put_binary(BSON::BSON_CODER.serialize(@fields, false, false, @connection.max_bson_size).to_s) if @fields
       message
     end
 
@@ -625,13 +584,21 @@ module Mongo
       spec['$maxScan']  = @max_scan if @max_scan
       spec['$returnKey']   = true if @return_key
       spec['$showDiskLoc'] = true if @show_disk_loc
+      spec['$comment']  = @comment if @comment
+      if needs_read_pref?
+        read_pref = Mongo::ReadPreference::mongos(@read, @tag_sets)
+        spec['$readPreference'] = read_pref if read_pref
+      end
       spec
     end
 
-    # Returns true if the query contains order, explain, hint, or snapshot.
+    def needs_read_pref?
+      @connection.mongos? && @read != :primary
+    end
+
     def query_contains_special_fields?
       @order || @explain || @hint || @snapshot || @show_disk_loc ||
-        @max_scan || @return_key
+        @max_scan || @return_key || @comment || needs_read_pref?
     end
 
     def close_cursor_if_query_complete

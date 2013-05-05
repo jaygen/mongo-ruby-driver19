@@ -1,21 +1,23 @@
 # encoding:utf-8
-require './test/bson/test_helper'
+require 'test_helper'
 require 'set'
 
 if RUBY_VERSION < '1.9'
-  require 'complex'
-  require 'rational'
+  silently do
+    require 'complex'
+    require 'rational'
+  end
 end
 require 'bigdecimal'
 
 begin
   require 'date'
   require 'tzinfo'
-  require 'active_support/core_ext'
+  require 'active_support/timezone'
   Time.zone = "Pacific Time (US & Canada)"
   Zone = Time.zone.now
 rescue LoadError
-  warn 'Mocking time with zone'
+  #warn 'Mocking time with zone'
   module ActiveSupport
     class TimeWithZone
       def initialize(utc_time, zone)
@@ -23,6 +25,18 @@ rescue LoadError
     end
   end
   Zone = ActiveSupport::TimeWithZone.new(Time.now.utc, 'EST')
+end
+
+begin
+  require 'active_support/multibyte/chars'
+rescue LoadError
+  warn 'Mocking ActiveSupport::Multibyte::Chars'
+  module ActiveSupport
+    module Multibyte
+      class Chars < String
+      end
+    end
+  end
 end
 
 class BSONTest < Test::Unit::TestCase
@@ -42,6 +56,68 @@ class BSONTest < Test::Unit::TestCase
     end
     assert_equal @encoder.serialize(doc).to_a, bson.to_a
     assert_equal doc, @encoder.deserialize(bson)
+  end
+
+  def test_interface
+    doc = { 'a' => 1 }
+    bson = BSON.serialize(doc)
+    assert_equal doc, BSON.deserialize(bson)
+  end
+
+  def test_read_bson_document
+    bson_file_data_h_star = ["21000000075f6964005115883c3d75c94d3aa18b63016100000000000000f03f00"]
+    strio = StringIO.new(bson_file_data_h_star.pack('H*'))
+    bson = BSON.read_bson_document(strio)
+    doc = {"_id"=>BSON::ObjectId('5115883c3d75c94d3aa18b63'), "a"=>1.0}
+    assert_equal doc, bson
+  end
+
+  def test_bson_ruby_interface
+    doc = { 'a' => 1 }
+    buf = BSON_RUBY.serialize(doc)
+    bson = BSON::BSON_RUBY.new
+    bson.instance_variable_set(:@buf, buf)
+    assert_equal [12, 0, 0, 0, 16, 97, 0, 1, 0, 0, 0, 0], bson.to_a
+    assert_equal "\f\x00\x00\x00\x10a\x00\x01\x00\x00\x00\x00", bson.to_s
+    assert_equal [12, 0, 0, 0, 16, 97, 0, 1, 0, 0, 0, 0], bson.unpack
+  end
+
+  def test_bson_ruby_hex_dump
+    doc = { 'a' => 1 }
+    buf = BSON_RUBY.serialize(doc)
+    bson = BSON_RUBY.new
+    bson.instance_variable_set(:@buf, buf)
+    doc_hex_dump = "   0:  0C 00 00 00 10 61 00 01\n   8:  00 00 00 00"
+    assert_equal doc_hex_dump, bson.hex_dump
+  end
+
+  def test_bson_ruby_dbref_not_used
+    buf = BSON::ByteBuffer.new
+    val = ns = 'namespace'
+
+    # Make a hole for the length
+    len_pos = buf.position
+    buf.put_int(0)
+
+    # Save the string
+    start_pos = buf.position
+    BSON::BSON_RUBY.serialize_cstr(buf, val)
+    end_pos = buf.position
+
+    # Put the string size in front
+    buf.put_int(end_pos - start_pos, len_pos)
+
+    # Go back to where we were
+    buf.position = end_pos
+
+    oid = ObjectId.new
+    buf.put_array(oid.to_a)
+    buf.rewind
+
+    bson = BSON::BSON_RUBY.new
+    bson.instance_variable_set(:@buf, buf)
+
+    assert_equal DBRef.new(ns, oid).to_s, bson.deserialize_dbref_data(buf).to_s
   end
 
   def test_require_hash
@@ -68,20 +144,27 @@ class BSONTest < Test::Unit::TestCase
     assert_doc_pass(doc)
   end
 
+  def test_valid_active_support_multibyte_chars
+    unless RUBY_PLATFORM =~ /java/
+      doc = {'doc' => ActiveSupport::Multibyte::Chars.new('aé')}
+      assert_doc_pass(doc)
+
+      bson = @encoder.serialize(doc)
+      doc = @encoder.deserialize(bson)
+      assert_equal doc['doc'], 'aé'
+    end
+  end
+
   def test_valid_utf8_key
     doc = {'aé' => 'hello'}
     assert_doc_pass(doc)
   end
 
   def test_limit_max_bson_size
-    doc = {'name' => 'a' * BSON_CODER.max_bson_size}
+    doc = {'name' => 'a' * BSON::DEFAULT_MAX_BSON_SIZE}
     assert_raise InvalidDocument do
       assert @encoder.serialize(doc)
     end
-  end
-
-  def test_max_bson_size
-    assert BSON_CODER.max_bson_size >= BSON::DEFAULT_MAX_BSON_SIZE
   end
 
   def test_update_max_bson_size
@@ -89,8 +172,10 @@ class BSONTest < Test::Unit::TestCase
     mock_conn = OpenStruct.new
     size      = 7 * 1024 * 1024
     mock_conn.max_bson_size = size
-    assert_equal size, BSON_CODER.update_max_bson_size(mock_conn)
-    assert_equal size, BSON_CODER.max_bson_size
+    silently do
+      assert_equal size, BSON_CODER.update_max_bson_size(mock_conn)
+      assert_equal size, BSON_CODER.max_bson_size
+    end
   end
 
   def test_round_trip
@@ -101,12 +186,11 @@ class BSONTest < Test::Unit::TestCase
   # In 1.8 we test that other string encodings raise an exception.
   # In 1.9 we test that they get auto-converted.
   if RUBY_VERSION < '1.9'
-    if ! RUBY_PLATFORM =~ /java/
+    unless RUBY_PLATFORM == 'java'
       require 'iconv'
       def test_non_utf8_string
         string = Iconv.conv('iso-8859-1', 'utf-8', 'aé')
         doc = {'doc' => string}
-        assert_doc_pass(doc)
         assert_raise InvalidStringEncoding do
           @encoder.serialize(doc)
         end
@@ -121,47 +205,62 @@ class BSONTest < Test::Unit::TestCase
       end
     end
   else
-    def test_non_utf8_string
-      assert_raise BSON::InvalidStringEncoding do
-        BSON::BSON_CODER.serialize({'str' => 'aé'.encode('iso-8859-1')})
+    unless RUBY_PLATFORM == 'java'
+      def test_non_utf8_string
+        assert_raise BSON::InvalidStringEncoding do
+          BSON::BSON_CODER.serialize({'str' => 'aé'.encode('iso-8859-1')})
+        end
       end
-    end
 
-    def test_invalid_utf8_string
-      str = "123\xD9"
-      assert !str.valid_encoding?
-      assert_raise BSON::InvalidStringEncoding do
-        BSON::BSON_CODER.serialize({'str' => str})
+      def test_invalid_utf8_string
+        str = "123\xD9"
+        assert !str.valid_encoding?
+        assert_raise BSON::InvalidStringEncoding do
+          BSON::BSON_CODER.serialize({'str' => str})
+        end
       end
-    end
 
-    def test_non_utf8_key
-      assert_raise BSON::InvalidStringEncoding do
-        BSON::BSON_CODER.serialize({'aé'.encode('iso-8859-1') => 'hello'})
+      def test_non_utf8_key
+        assert_raise BSON::InvalidStringEncoding do
+          BSON::BSON_CODER.serialize({'aé'.encode('iso-8859-1') => 'hello'})
+        end
       end
-    end
 
-    # Based on a test from sqlite3-ruby
-    def test_default_internal_is_honored
-      before_enc = Encoding.default_internal
+      def test_forced_encoding_with_valid_utf8
+        doc = {'doc' => "\xC3\xB6".force_encoding("ISO-8859-1")}
+        serialized = @encoder.serialize(doc)
+        deserialized = @encoder.deserialize(serialized)
+        assert_equal(doc['doc'], deserialized['doc'].force_encoding("ISO-8859-1"))
+      end
 
-      str = "壁に耳あり、障子に目あり"
-      bson = BSON::BSON_CODER.serialize("x" => str)
+      # Based on a test from sqlite3-ruby
+      def test_default_internal_is_honored
+        before_enc = Encoding.default_internal
 
-      silently { Encoding.default_internal = 'EUC-JP' }
-      out = BSON::BSON_CODER.deserialize(bson)["x"]
+        str = "壁に耳あり、障子に目あり"
+        bson = BSON::BSON_CODER.serialize("x" => str)
 
-      assert_equal Encoding.default_internal, out.encoding
-      assert_equal str.encode('EUC-JP'), out
-      assert_equal str, out.encode(str.encoding)
-    ensure
-      silently { Encoding.default_internal = before_enc }
+        silently { Encoding.default_internal = 'EUC-JP' }
+        out = BSON::BSON_CODER.deserialize(bson)["x"]
+
+        assert_equal Encoding.default_internal, out.encoding
+        assert_equal str.encode('EUC-JP'), out
+        assert_equal str, out.encode(str.encoding)
+      ensure
+        silently { Encoding.default_internal = before_enc }
+      end
     end
   end
 
   def test_code
-    doc = {'$where' => Code.new('this.a.b < this.b')}
+    code = Code.new('this.a.b < this.b')
+    assert_equal 17, code.length
+    assert_match /<BSON::Code:.*@data="this.a.b < this.b".*>/, code.inspect
+    doc = {'$where' => code}
     assert_doc_pass(doc)
+    code = 'this.c.d < this.e'.to_bson_code # core_ext.rb
+    assert_equal BSON::Code, code.class
+    assert_equal code, code.to_bson_code
   end
 
   def test_code_with_symbol
@@ -217,10 +316,10 @@ class BSONTest < Test::Unit::TestCase
     doc = {'doc' => {'age' => 42, 'date' => Time.now.utc, 'shoe_size' => 9.5}}
     bson = @encoder.serialize(doc)
     doc2 = @encoder.deserialize(bson)
-    assert doc['doc']
-    assert_equal 42,  doc['doc']['age']
-    assert_equal 9.5, doc['doc']['shoe_size']
-    assert_in_delta Time.now, doc['doc']['date'], 1
+    assert doc2['doc']
+    assert_equal 42,  doc2['doc']['age']
+    assert_equal 9.5, doc2['doc']['shoe_size']
+    assert_in_delta Time.now, doc2['doc']['date'], 1
   end
 
   def test_oid
@@ -269,6 +368,7 @@ class BSONTest < Test::Unit::TestCase
     doc = {'date' => [Time.now.utc]}
     bson = @encoder.serialize(doc)
     doc2 = @encoder.deserialize(bson)
+    assert doc2
   end
 
   def test_date_returns_as_utc
@@ -279,6 +379,7 @@ class BSONTest < Test::Unit::TestCase
   end
 
   def test_date_before_epoch
+    if RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/ then return true end
     begin
       doc = {'date' => Time.utc(1600)}
       bson = @encoder.serialize(doc)
@@ -297,7 +398,7 @@ class BSONTest < Test::Unit::TestCase
     [DateTime.now, Date.today, Zone].each do |invalid_date|
       doc = {:date => invalid_date}
       begin
-      bson = BSON::BSON_CODER.serialize(doc)
+      BSON::BSON_CODER.serialize(doc)
       rescue => e
       ensure
         if !invalid_date.is_a? Time
@@ -310,13 +411,16 @@ class BSONTest < Test::Unit::TestCase
 
   def test_dbref
     oid = ObjectId.new
+    ns = 'namespace'
     doc = {}
-    doc['dbref'] = DBRef.new('namespace', oid)
+    dbref = DBRef.new(ns, oid)
+    assert_equal({"$id"=>oid, "$ns"=>ns}, dbref.to_hash)
+    doc['dbref'] = dbref
     bson = @encoder.serialize(doc)
     doc2 = @encoder.deserialize(bson)
 
     # Java doesn't deserialize to DBRefs
-    if RUBY_PLATFORM =~ /java/
+    if RUBY_PLATFORM =~ /java/ && BSON.extension?
       assert_equal 'namespace', doc2['dbref']['$ns']
       assert_equal oid, doc2['dbref']['$id']
     else
@@ -431,7 +535,7 @@ class BSONTest < Test::Unit::TestCase
 
   if !(RUBY_PLATFORM =~ /java/)
     def test_timestamp
-      val = {"test" => [4, 20]}
+      # val = {"test" => [4, 20]}
       result = @encoder.deserialize([0x13, 0x00, 0x00, 0x00,
                                      0x11, 0x74, 0x65, 0x73,
                                      0x74, 0x00, 0x04, 0x00,
@@ -455,7 +559,7 @@ class BSONTest < Test::Unit::TestCase
   def test_overflow
     doc = {"x" => 2**75}
     assert_raise RangeError do
-      bson = @encoder.serialize(doc)
+      @encoder.serialize(doc)
     end
 
     doc = {"x" => 9223372036854775}
@@ -466,7 +570,7 @@ class BSONTest < Test::Unit::TestCase
 
     doc["x"] = doc["x"] + 1
     assert_raise RangeError do
-      bson = @encoder.serialize(doc)
+      @encoder.serialize(doc)
     end
 
     doc = {"x" => -9223372036854775}
@@ -477,7 +581,7 @@ class BSONTest < Test::Unit::TestCase
 
     doc["x"] = doc["x"] - 1
     assert_raise RangeError do
-      bson = BSON::BSON_CODER.serialize(doc)
+      BSON::BSON_CODER.serialize(doc)
     end
   end
 
@@ -529,7 +633,7 @@ class BSONTest < Test::Unit::TestCase
     #one = {"_foo" => "foo"}
 
     #assert_equal @encoder.serialize(one).to_a, @encoder.serialize(dup).to_a
-    warn "Pending test for duplicate keys"
+    #warn "Pending test for duplicate keys"
   end
 
   def test_no_duplicate_id_when_moving_id

@@ -1,26 +1,11 @@
 /*
- * Copyright 2009-2010 10gen, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-/*
  * This file contains C implementations of some of the functions needed by the
  * bson module. If possible, these implementations should be used to speed up
  * BSON encoding and decoding.
  */
 
 #include "ruby.h"
+#include "version.h"
 
 /* Ensure compatibility with early releases of Ruby 1.8.5 */
 #ifndef RSTRING_PTR
@@ -92,6 +77,7 @@ static VALUE OrderedHash;
 static VALUE InvalidKeyName;
 static VALUE InvalidStringEncoding;
 static VALUE InvalidDocument;
+static VALUE InvalidObjectId;
 static VALUE DigestMD5;
 static VALUE RB_HASH;
 
@@ -108,14 +94,12 @@ static int max_bson_size;
         }                                                               \
         _str;                                                           \
     })
-#define TO_UTF8(string) rb_str_export_to_enc((string), rb_utf8_encoding())
 #else
 #define STR_NEW(p,n) rb_str_new((p), (n))
-#define TO_UTF8(string) (string)
 #endif
 
 static void write_utf8(bson_buffer_t buffer, VALUE string, char check_null) {
-    result_t status = check_string(RSTRING_PTR(string), RSTRING_LEN(string),
+    result_t status = check_string((unsigned char*)RSTRING_PTR(string), RSTRING_LEN(string),
                                    1, check_null);
     if (status == HAS_NULL) {
         bson_buffer_free(buffer);
@@ -124,8 +108,7 @@ static void write_utf8(bson_buffer_t buffer, VALUE string, char check_null) {
         bson_buffer_free(buffer);
         rb_raise(InvalidStringEncoding, "String not valid UTF-8");
     }
-    string = TO_UTF8(string);
-    SAFE_WRITE(buffer, RSTRING_PTR(string), RSTRING_LEN(string));
+    SAFE_WRITE(buffer, RSTRING_PTR(string), (int)RSTRING_LEN(string));
 }
 
 // this sucks. but for some reason these moved around between 1.8 and 1.9
@@ -229,12 +212,12 @@ static int write_element(VALUE key, VALUE value, VALUE extra, int allow_id) {
         int i;
         if (RSTRING_LEN(key) > 0 && RSTRING_PTR(key)[0] == '$') {
             bson_buffer_free(buffer);
-            rb_raise(InvalidKeyName, "%s - key must not start with '$'", RSTRING_PTR(key));
+            rb_raise(InvalidKeyName, "key %s must not start with '$'", RSTRING_PTR(key));
         }
         for (i = 0; i < RSTRING_LEN(key); i++) {
             if (RSTRING_PTR(key)[i] == '.') {
                 bson_buffer_free(buffer);
-                rb_raise(InvalidKeyName, "%s - key must not contain '.'", RSTRING_PTR(key));
+                rb_raise(InvalidKeyName, "key %s must not contain '.'", RSTRING_PTR(key));
             }
         }
     }
@@ -300,7 +283,6 @@ static int write_element(VALUE key, VALUE value, VALUE extra, int allow_id) {
         {
             bson_buffer_position length_location, start_position, obj_length;
             int items, i;
-            VALUE* values;
 
             write_name_and_type(buffer, key, 0x04);
             start_position = bson_buffer_get_position(buffer);
@@ -435,10 +417,14 @@ static int write_element(VALUE key, VALUE value, VALUE extra, int allow_id) {
                 break;
             }
             if (strcmp(cls, "BSON::Timestamp") == 0) {
+                unsigned int seconds;
+                unsigned int increment;
+
                 write_name_and_type(buffer, key, 0x11);
-                unsigned int seconds = NUM2UINT(
+
+                seconds = NUM2UINT(
                     rb_funcall(value, rb_intern("seconds"), 0));
-                unsigned int increment = NUM2UINT(
+                increment = NUM2UINT(
                     rb_funcall(value, rb_intern("increment"), 0));
 
                 SAFE_WRITE(buffer, (const char*)&increment, 4);
@@ -455,6 +441,16 @@ static int write_element(VALUE key, VALUE value, VALUE extra, int allow_id) {
                 rb_raise(InvalidDocument, "Cannot serialize the Numeric type %s as BSON; only Bignum, Fixnum, and Float are supported.", cls);
                 break;
             }
+            if (strcmp(cls, "ActiveSupport::Multibyte::Chars") == 0) {
+                int length;
+                VALUE str = StringValue(value);
+                write_name_and_type(buffer, key, 0x02);
+                length = RSTRING_LENINT(str) + 1;
+                SAFE_WRITE(buffer, (char*)&length, 4);
+                write_utf8(buffer, str, 0);
+                SAFE_WRITE(buffer, &zero, 1);
+                break;
+            }
             bson_buffer_free(buffer);
             rb_raise(InvalidDocument, "Cannot serialize an object of class %s into BSON.", cls);
             break;
@@ -467,6 +463,12 @@ static int write_element(VALUE key, VALUE value, VALUE extra, int allow_id) {
                 long long time_since_epoch = (long long)round(t * 1000);
                 write_name_and_type(buffer, key, 0x09);
                 SAFE_WRITE(buffer, (const char*)&time_since_epoch, 8);
+                break;
+            }
+            // Date classes are TYPE T_DATA in Ruby >= 1.9.3
+            if (strcmp(cls, "DateTime") == 0 || strcmp(cls, "Date") == 0 || strcmp(cls, "ActiveSupport::TimeWithZone") == 0) {
+                bson_buffer_free(buffer);
+                rb_raise(InvalidDocument, "%s is not currently supported; use a UTC Time instance instead.", cls);
                 break;
             }
             if(strcmp(cls, "BigDecimal") == 0) {
@@ -598,11 +600,11 @@ static void write_doc(bson_buffer_t buffer, VALUE hash, VALUE check_keys, VALUE 
     SAFE_WRITE(buffer, &zero, 1);
     length = bson_buffer_get_position(buffer) - start_position;
 
-    // make sure that length doesn't exceed 4MB
+    // make sure that length doesn't exceed the max size (determined by server, defaults to 4mb)
     if (length > bson_buffer_get_max_size(buffer)) {
       bson_buffer_free(buffer);
       rb_raise(InvalidDocument,
-          "Document too large: This BSON documents is limited to %d bytes.",
+          "Document too large: This BSON document is limited to %d bytes.",
           bson_buffer_get_max_size(buffer));
       return;
     }
@@ -736,10 +738,23 @@ static VALUE get_value(const char* buffer, int* position, int type) {
         }
     case 9:
         {
-            long long millis;
+            int64_t millis;
             memcpy(&millis, buffer + *position, 8);
 
-            value = rb_time_new(millis / 1000, (millis % 1000) * 1000);
+            // Support 64-bit time values in 32 bit environments in Ruby > 1.9
+            // Note: rb_time_num_new is not available pre Ruby 1.9
+            #if RUBY_API_VERSION_CODE >= 10900
+                #define add(x,y) (rb_funcall((x), '+', 1, (y)))
+                #define mul(x,y) (rb_funcall((x), '*', 1, (y)))
+                #define quo(x,y) (rb_funcall((x), rb_intern("quo"), 1, (y)))
+                VALUE d, timev;
+                d = LL2NUM(1000LL);
+                timev = add(LL2NUM(millis / 1000), quo(LL2NUM(millis % 1000), d));
+                value = rb_time_num_new(timev, Qnil);
+            #else
+                value = rb_time_new(millis / 1000, (millis % 1000) * 1000);
+            #endif
+
             value = rb_funcall(value, utc_method, 0);
             *position += 8;
             break;
@@ -893,6 +908,91 @@ static VALUE method_deserialize(VALUE self, VALUE bson) {
     return elements_to_hash(buffer, remaining);
 }
 
+static int legal_objectid_str(VALUE str) {
+    int i;
+
+    if (TYPE(str) != T_STRING) {
+        return 0;
+    }
+
+    if (RSTRING_LEN(str) != 24) {
+        return 0;
+    }
+
+    for(i = 0; i < 24; i++) {
+        char c = RSTRING_PTR(str)[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static VALUE objectid_legal(VALUE self, VALUE str)
+{
+    if (legal_objectid_str(str))
+        return Qtrue;
+    return Qfalse;
+}
+
+static char hexbyte( char hex ) {
+    if (hex >= '0' && hex <= '9')
+        return (hex - '0');
+    else if (hex >= 'A' && hex <= 'F')
+        return (hex - 'A' + 10);
+    else if (hex >= 'a' && hex <= 'f')
+        return (hex - 'a' + 10);
+    else
+        return 0x0;
+}
+
+static VALUE objectid_from_string(VALUE self, VALUE str)
+{
+    VALUE oid;
+    int i;
+
+    if (!legal_objectid_str(str)) {
+      if (TYPE(str) == T_STRING) {
+        rb_raise(InvalidObjectId, "illegal ObjectId format: %s", RSTRING_PTR(str));
+      } else {
+        VALUE inspect;
+        inspect = rb_funcall(str, rb_intern("to_s"), 0);
+        rb_raise(InvalidObjectId, "not a String: %s", (char *)inspect);
+      }
+    }
+
+    oid = rb_ary_new2(12);
+
+    for(i = 0; i < 12; i++) {
+        rb_ary_store(oid, i, INT2FIX( (unsigned)(hexbyte( RSTRING_PTR(str)[2*i] ) << 4 ) | hexbyte( RSTRING_PTR(str)[2*i + 1] )));
+    }
+
+    return rb_class_new_instance(1, &oid, ObjectId);
+}
+
+static VALUE objectid_to_s(VALUE self)
+{
+    VALUE data;
+    char cstr[25];
+    VALUE rstr;
+    VALUE *data_arr;
+
+    data = rb_iv_get(self, "@data");
+    data_arr = RARRAY_PTR(data);
+
+    sprintf(cstr, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+        (unsigned)NUM2INT(data_arr[0]), (unsigned)NUM2INT(data_arr[1]), (unsigned)NUM2INT(data_arr[2]), (unsigned)NUM2INT(data_arr[3]),
+        (unsigned)NUM2INT(data_arr[4]), (unsigned)NUM2INT(data_arr[5]), (unsigned)NUM2INT(data_arr[6]), (unsigned)NUM2INT(data_arr[7]),
+        (unsigned)NUM2INT(data_arr[8]), (unsigned)NUM2INT(data_arr[9]), (unsigned)NUM2INT(data_arr[10]), (unsigned)NUM2INT(data_arr[11]));
+
+    rstr = rb_str_new(cstr, 24);
+
+    return rstr;
+}
+
+
 static VALUE objectid_generate(int argc, VALUE* args, VALUE self)
 {
     VALUE oid;
@@ -914,7 +1014,7 @@ static VALUE objectid_generate(int argc, VALUE* args, VALUE self)
     MEMCPY(&oid_bytes[7], &pid, unsigned char, 2);
 
     /* No need to synchronize modification of this counter between threads;
-     * MRI global interpreter lock guarantees serializaility.
+     * MRI global interpreter lock guarantees serializability.
      *
      * Compiler should optimize out impossible branch.
      */
@@ -971,6 +1071,7 @@ void Init_cbson() {
     InvalidKeyName = rb_const_get(bson, rb_intern("InvalidKeyName"));
     InvalidStringEncoding = rb_const_get(bson, rb_intern("InvalidStringEncoding"));
     InvalidDocument = rb_const_get(bson, rb_intern("InvalidDocument"));
+    InvalidObjectId = rb_const_get(bson, rb_intern("InvalidObjectId"));
     rb_require("bson/ordered_hash");
     OrderedHash = rb_const_get(bson, rb_intern("OrderedHash"));
     RB_HASH = rb_const_get(bson, rb_intern("Hash"));
@@ -987,6 +1088,9 @@ void Init_cbson() {
     Digest = rb_const_get(rb_cObject, rb_intern("Digest"));
     DigestMD5 = rb_const_get(Digest, rb_intern("MD5"));
 
+    rb_define_singleton_method(ObjectId, "legal?", objectid_legal, 1);
+    rb_define_singleton_method(ObjectId, "from_string", objectid_from_string, 1);
+    rb_define_method(ObjectId, "to_s", objectid_to_s, 0);
     rb_define_method(ObjectId, "generate", objectid_generate, -1);
 
     if (gethostname(hostname, MAX_HOSTNAME_LENGTH) != 0) {

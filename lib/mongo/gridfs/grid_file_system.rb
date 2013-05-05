@@ -1,21 +1,3 @@
-# encoding: UTF-8
-
-# --
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ++
-
 module Mongo
 
   # A file store built on the GridFS specification featuring
@@ -39,19 +21,19 @@ module Mongo
 
       @default_query_opts = {:sort => [['filename', 1], ['uploadDate', -1]], :limit => 1}
 
-      # Create indexes only if we're connected to a primary node.
+      # This will create indexes only if we're connected to a primary node.
       connection = @db.connection
-      if (connection.class == Connection && connection.read_primary?) ||
-          (connection.class == ReplSetConnection && connection.primary)
-        @files.create_index([['filename', 1], ['uploadDate', -1]])
-        @chunks.create_index([['files_id', Mongo::ASCENDING], ['n', Mongo::ASCENDING]], :unique => true)
+      begin
+        @files.ensure_index([['filename', 1], ['uploadDate', -1]])
+        @chunks.ensure_index([['files_id', Mongo::ASCENDING], ['n', Mongo::ASCENDING]], :unique => true)
+      rescue Mongo::ConnectionFailure
       end
     end
 
     # Open a file for reading or writing. Note that the options for this method only apply
     # when opening in 'w' mode.
     #
-    # Note that arbitary metadata attributes can be saved to the file by passing
+    # Note that arbitrary metadata attributes can be saved to the file by passing
     # them is as options.
     #
     # @param [String] filename the name of the file.
@@ -69,26 +51,32 @@ module Mongo
     # @option opts [Boolean] :delete_old (false) ensure that old versions of the file are deleted. This option
     #  only work in 'w' mode. Certain precautions must be taken when deleting GridFS files. See the notes under
     #  GridFileSystem#delete.
-    # @option opts [Boolean] :safe (false) When safe mode is enabled, the chunks sent to the server
-    #   will be validated using an md5 hash. If validation fails, an exception will be raised.
+    # @option opts [String, Integer, Symbol] :w (1) Set write concern
+    #
+    #   Notes on write concern:
+    #     When :w > 0, the chunks sent to the server
+    #     will be validated using an md5 hash. If validation fails, an exception will be raised.
+    # @option opts [Integer] :versions (false) deletes all versions which exceed the number specified to 
+    #   retain ordered by uploadDate. This option only works in 'w' mode. Certain precautions must be taken when 
+    #   deleting GridFS files. See the notes under GridFileSystem#delete.
     #
     # @example
     #
     #  # Store the text "Hello, world!" in the grid file system.
-    #  @grid = GridFileSystem.new(@db)
+    #  @grid = Mongo::GridFileSystem.new(@db)
     #  @grid.open('filename', 'w') do |f|
     #    f.write "Hello, world!"
     #  end
     #
     #  # Output "Hello, world!"
-    #  @grid = GridFileSystem.new(@db)
+    #  @grid = Mongo::GridFileSystem.new(@db)
     #  @grid.open('filename', 'r') do |f|
     #    puts f.read
     #  end
     #
     #  # Write a file on disk to the GridFileSystem
     #  @file = File.open('image.jpg')
-    #  @grid = GridFileSystem.new(@db)
+    #  @grid = Mongo::GridFileSystem.new(@db)
     #  @grid.open('image.jpg, 'w') do |f|
     #    f.write @file
     #  end
@@ -97,7 +85,21 @@ module Mongo
     def open(filename, mode, opts={})
       opts = opts.dup
       opts.merge!(default_grid_io_opts(filename))
-      del  = opts.delete(:delete_old) && mode == 'w'
+      if mode == 'w'
+        begin
+          # Ensure there are the appropriate indexes, as state may have changed since instantiation of self.
+          # Recall that index definitions are cached with ensure_index so this statement won't unneccesarily repeat index creation.
+          @files.ensure_index([['filename', 1], ['uploadDate', -1]])
+          @chunks.ensure_index([['files_id', Mongo::ASCENDING], ['n', Mongo::ASCENDING]], :unique => true)
+          versions = opts.delete(:versions)
+          if opts.delete(:delete_old) || (versions && versions < 1)
+            versions = 1
+          end
+        rescue Mongo::ConnectionFailure => e
+          raise e, "Failed to create necessary indexes and write data."
+          return
+        end
+      end
       file = GridIO.new(@files, @chunks, filename, mode, opts)
       return file unless block_given?
       result = nil
@@ -105,9 +107,9 @@ module Mongo
         result = yield file
       ensure
         id = file.close
-        if del
+        if versions
           self.delete do
-            @files.find({'filename' => filename, '_id' => {'$ne' => id}}, :fields => ['_id'])
+            @files.find({'filename' => filename, '_id' => {'$ne' => id}}, :fields => ['_id'], :sort => ['uploadDate', -1], :skip => (versions - 1))
           end
         end
       end

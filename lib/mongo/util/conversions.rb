@@ -1,20 +1,3 @@
-# encoding: UTF-8
-
-# --
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ++
 module Mongo #:nodoc:
 
   # Utility module to include when needing to convert certain types of
@@ -23,6 +6,29 @@ module Mongo #:nodoc:
 
     ASCENDING_CONVERSION  = ["ascending", "asc", "1"]
     DESCENDING_CONVERSION = ["descending", "desc", "-1"]
+
+    # Allows sort parameters to be defined as a Hash.
+    # Does not allow usage of un-ordered hashes, therefore
+    # Ruby 1.8.x users must use BSON::OrderedHash.
+    #
+    # Example:
+    #
+    # <tt>hash_as_sort_parameters({:field1 => :asc, "field2" => :desc})</tt> =>
+    # <tt>{ "field1" => 1, "field2" => -1}</tt>
+    def hash_as_sort_parameters(value)
+      if RUBY_VERSION < '1.9' && !value.is_a?(BSON::OrderedHash)
+        raise InvalidSortValueError.new(
+          "Hashes used to supply sort order must maintain ordering." +
+          "Use BSON::OrderedHash."
+        )
+      else
+        order_by = value.inject({}) do |memo, (key, direction)|
+          memo[key.to_s] = sort_value(direction.to_s.downcase)
+          memo
+        end
+      end
+      order_by
+    end
 
     # Converts the supplied +Array+ to a +Hash+ to pass to mongo as
     # sorting parameters. The returned +Hash+ will vary depending 

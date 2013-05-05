@@ -1,5 +1,4 @@
-require './test/bson/test_helper'
-require 'rubygems'
+require 'test_helper'
 require 'json'
 
 class ObjectIdTest < Test::Unit::TestCase
@@ -71,8 +70,14 @@ class ObjectIdTest < Test::Unit::TestCase
   end
 
   def test_illegal_from_string
-    assert_raise InvalidObjectId do 
+    assert_raise InvalidObjectId do
       ObjectId.from_string("")
+    end
+  end
+
+  def test_from_string_with_object_id
+    assert_raise InvalidObjectId do
+      ObjectId.from_string(@o)
     end
   end
 
@@ -134,5 +139,15 @@ class ObjectIdTest < Test::Unit::TestCase
   def test_as_json
     id = ObjectId.new
     assert_equal({"$oid" => id.to_s}, id.as_json)
+  end
+
+  def test_object_id_array_flatten
+    id = ObjectId.new
+    assert_equal [ id ], [[ id ]].flatten
+  end
+
+  def test_object_id_array_flatten_bang
+    id = ObjectId.new
+    assert_equal [ id ], [[ id ]].flatten!
   end
 end

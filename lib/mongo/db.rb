@@ -1,36 +1,24 @@
-# encoding: UTF-8
-
-# --
-# Copyright (C) 2008-2011 10gen Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ++
-
 require 'socket'
-require 'timeout'
 require 'thread'
 
 module Mongo
 
   # A MongoDB database.
   class DB
+    include Mongo::WriteConcern
 
-    SYSTEM_NAMESPACE_COLLECTION = "system.namespaces"
-    SYSTEM_INDEX_COLLECTION = "system.indexes"
-    SYSTEM_PROFILE_COLLECTION = "system.profile"
-    SYSTEM_USER_COLLECTION = "system.users"
-    SYSTEM_JS_COLLECTION = "system.js"
-    SYSTEM_COMMAND_COLLECTION = "$cmd"
+    SYSTEM_NAMESPACE_COLLECTION = 'system.namespaces'
+    SYSTEM_INDEX_COLLECTION     = 'system.indexes'
+    SYSTEM_PROFILE_COLLECTION   = 'system.profile'
+    SYSTEM_USER_COLLECTION      = 'system.users'
+    SYSTEM_JS_COLLECTION        = 'system.js'
+    SYSTEM_COMMAND_COLLECTION   = '$cmd'
+
+    PROFILE_LEVEL = {
+      :off       => 0,
+      :slow_only => 1,
+      :all       => 2
+    }
 
     # Counter for generating unique request ids.
     @@current_request_id = 0
@@ -40,54 +28,77 @@ module Mongo
     # collection that already exists, raises an error.
     #
     # Strict mode is disabled by default, but enabled (+true+) at any time.
-    attr_writer :strict
+    #
+    # @deprecated Support for strict will be removed in version 2.0 of the driver.
+    def strict=(value)
+      unless ENV['TEST_MODE']
+        warn "Support for strict mode has been deprecated and will be " +
+             "removed in version 2.0 of the driver."
+      end
+      @strict = value
+    end
 
     # Returns the value of the +strict+ flag.
-    def strict?; @strict; end
+    #
+    # @deprecated Support for strict will be removed in version 2.0 of the driver.
+    def strict?
+      @strict
+    end
 
-    # The name of the database and the local safe option.
-    attr_reader :name, :safe
+    # The name of the database and the local write concern options.
+    attr_reader :name, :write_concern
 
-    # The Mongo::Connection instance connecting to the MongoDB server.
+    # The Mongo::MongoClient instance connecting to the MongoDB server.
     attr_reader :connection
 
     # The length of time that Collection.ensure_index should cache index calls
     attr_accessor :cache_time
 
+    # Read Preference
+    attr_accessor :read, :tag_sets, :acceptable_latency
+
     # Instances of DB are normally obtained by calling Mongo#db.
     #
     # @param [String] name the database name.
-    # @param [Mongo::Connection] connection a connection object pointing to MongoDB. Note
-    #   that databases are usually instantiated via the Connection class. See the examples below.
+    # @param [Mongo::MongoClient] client a connection object pointing to MongoDB. Note
+    #   that databases are usually instantiated via the MongoClient class. See the examples below.
     #
-    # @option opts [Boolean] :strict (False) If true, collections must exist to be accessed and must
-    #   not exist to be created. See DB#collection and DB#create_collection.
+    # @option opts [Boolean] :strict (False) [DEPRECATED] If true, collections existence checks are
+    # performed during a number of relevant operations. See DB#collection, DB#create_collection and
+    # DB#drop_collection.
     #
     # @option opts [Object, #create_pk(doc)] :pk (BSON::ObjectId) A primary key factory object,
     #   which should take a hash and return a hash which merges the original hash with any primary key
     #   fields the factory wishes to inject. (NOTE: if the object already has a primary key,
     #   the factory should not inject a new key).
     #
-    # @option opts [Boolean, Hash] :safe (false) Set the default safe-mode options
-    #   propagated to Collection objects instantiated off of this DB. If no
-    #   value is provided, the default value set on this instance's Connection object will be used. This
-    #   default can be overridden upon instantiation of any collection by explicity setting a :safe value
-    #   on initialization
+    # @option opts [String, Integer, Symbol] :w (1) Set default number of nodes to which a write
+    #   should be acknowledged
+    # @option opts [Boolean] :j (false) Set journal acknowledgement
+    # @option opts [Integer] :wtimeout (nil) Set replica set acknowledgement timeout
+    # @option opts [Boolean] :fsync (false) Set fsync acknowledgement.
+    #
+    #   Notes on write concern:
+    #     These write concern options are propagated to Collection objects instantiated off of this DB. If no
+    #     options are provided, the default write concern set on this instance's MongoClient object will be used. This
+    #     default can be overridden upon instantiation of any collection by explicitly setting write concern options
+    #     on initialization or at the time of an operation.
+    #
     # @option opts [Integer] :cache_time (300) Set the time that all ensure_index calls should cache the command.
     #
     # @core databases constructor_details
-    def initialize(name, connection, opts={})
+    def initialize(name, client, opts={})
       @name       = Mongo::Support.validate_db_name(name)
-      @connection = connection
+      @connection = client
       @strict     = opts[:strict]
       @pk_factory = opts[:pk]
-      @safe       = opts.fetch(:safe, @connection.safe)
-      if value = opts[:read]
-        Mongo::Support.validate_read_preference(value)
-      else
-        value = @connection.read_preference
-      end
-      @read_preference = value.is_a?(Hash) ? value.dup : value
+
+      @write_concern = get_write_concern(opts, client)
+
+      @read = opts[:read] || @connection.read
+      Mongo::ReadPreference::validate(@read)
+      @tag_sets = opts.fetch(:tag_sets, @connection.tag_sets)
+      @acceptable_latency = opts.fetch(:acceptable_latency, @connection.acceptable_latency)
       @cache_time = opts[:cache_time] || 300 #5 minutes.
     end
 
@@ -97,7 +108,7 @@ module Mongo
     # @param [String] username
     # @param [String] password
     # @param [Boolean] save_auth
-    #   Save this authentication to the connection object using Connection#add_auth. This
+    #   Save this authentication to the client object using MongoClient#add_auth. This
     #   will ensure that the authentication will be applied on database reconnect. Note
     #   that this value must be true when using connection pooling.
     #
@@ -107,14 +118,18 @@ module Mongo
     #
     # @core authenticate authenticate-instance_method
     def authenticate(username, password, save_auth=true)
-      if @connection.pool_size > 1
-        if !save_auth
-          raise MongoArgumentError, "If using connection pooling, :save_auth must be set to true."
-        end
-        @connection.authenticate_pools
+      if @connection.pool_size > 1 && !save_auth
+        raise MongoArgumentError, "If using connection pooling, :save_auth must be set to true."
       end
 
-      issue_authentication(username, password, save_auth)
+      begin
+        socket = @connection.checkout_reader(:mode => :primary_preferred)
+        issue_authentication(username, password, save_auth, :socket => socket)
+      ensure
+        socket.checkin if socket
+      end
+
+      @connection.authenticate_pools
     end
 
     def issue_authentication(username, password, save_auth=true, opts={})
@@ -128,17 +143,15 @@ module Mongo
       auth['nonce'] = nonce
       auth['key'] = Mongo::Support.auth_key(username, password, nonce)
       if ok?(doc = self.command(auth, :check_response => false, :socket => opts[:socket]))
-        if save_auth
-          @connection.add_auth(@name, username, password)
-        end
-        true
+        @connection.add_auth(@name, username, password) if save_auth
       else
         message = "Failed to authenticate user '#{username}' on db '#{self.name}'"
         raise Mongo::AuthenticationError.new(message, doc['code'], doc)
       end
+      true
     end
 
-    # Adds a stored Javascript function to the database which can executed  
+    # Adds a stored Javascript function to the database which can executed
     # server-side in map_reduce, db.eval and $where clauses.
     #
     # @param [String] function_name
@@ -148,7 +161,7 @@ module Mongo
     def add_stored_function(function_name, code)
       self[SYSTEM_JS_COLLECTION].save(
         {
-          "_id" => function_name, 
+          "_id" => function_name,
           :value => BSON::Code.new(code)
         }
       )
@@ -161,11 +174,8 @@ module Mongo
     #
     # @return [Boolean]
     def remove_stored_function(function_name)
-      if self[SYSTEM_JS_COLLECTION].find_one({"_id" => function_name})
-        self[SYSTEM_JS_COLLECTION].remove({"_id" => function_name}, :safe => true)
-      else
-        return false
-      end
+      return false unless self[SYSTEM_JS_COLLECTION].find_one({"_id" => function_name})
+      self[SYSTEM_JS_COLLECTION].remove({"_id" => function_name}, :w => 1)
     end
 
     # Adds a user to this database for use with authentication. If the user already
@@ -173,14 +183,22 @@ module Mongo
     #
     # @param [String] username
     # @param [String] password
+    # @param [Boolean] read_only
+    #   Create a read-only user.
     #
     # @return [Hash] an object representing the user.
-    def add_user(username, password)
+    def add_user(username, password, read_only = false)
       users = self[SYSTEM_USER_COLLECTION]
       user  = users.find_one({:user => username}) || {:user => username}
       user['pwd'] = Mongo::Support.hash_password(username, password)
-      users.save(user)
-      return user
+      user['readOnly'] = true if read_only;
+      begin
+        users.save(user)
+      rescue OperationFailure => ex
+        # adding first admin user fails GLE in MongoDB 2.2
+        raise ex unless ex.message =~ /login/
+      end
+      user
     end
 
     # Remove the given user from this database. Returns false if the user
@@ -191,35 +209,31 @@ module Mongo
     # @return [Boolean]
     def remove_user(username)
       if self[SYSTEM_USER_COLLECTION].find_one({:user => username})
-        self[SYSTEM_USER_COLLECTION].remove({:user => username}, :safe => true)
+        self[SYSTEM_USER_COLLECTION].remove({:user => username}, :w => 1)
       else
-        return false
+        false
       end
     end
 
-    # Deauthorizes use for this database for this connection. Also removes
-    # any saved authentication in the connection class associated with this
+    # Deauthorizes use for this database for this client connection. Also removes
+    # any saved authentication in the MongoClient class associated with this
     # database.
     #
     # @raise [MongoDBError] if logging out fails.
     #
     # @return [Boolean]
     def logout(opts={})
-      if @connection.pool_size > 1
-        @connection.logout_pools(@name)
-      end
-
+      @connection.logout_pools(@name) if @connection.pool_size > 1
       issue_logout(opts)
     end
 
     def issue_logout(opts={})
-      doc = command({:logout => 1}, :socket => opts[:socket])
-      if ok?(doc)
+      if ok?(doc = command({:logout => 1}, :socket => opts[:socket]))
         @connection.remove_auth(@name)
-        true
       else
-        raise MongoDBError, "error logging out: #{doc.inspect}"
+        raise MongoDBError, "Error logging out: #{doc.inspect}"
       end
+      true
     end
 
     # Get an array of collection names in this database.
@@ -244,7 +258,7 @@ module Mongo
     # a cursor which can be iterated over. For each collection, a hash
     # will be yielded containing a 'name' string and, optionally, an 'options' hash.
     #
-    # @param [String] coll_name return info for the specifed collection only.
+    # @param [String] coll_name return info for the specified collection only.
     #
     # @return [Mongo::Cursor]
     def collections_info(coll_name=nil)
@@ -277,20 +291,19 @@ module Mongo
     # @return [Mongo::Collection]
     def create_collection(name, opts={})
       name = name.to_s
-      if collection_names.include?(name)
-        if strict?
-          raise MongoDBError, "Collection #{name} already exists. " +
-            "Currently in strict mode."
-        else
-          return Collection.new(name, self, opts)
-        end
+      if strict? && collection_names.include?(name)
+        raise MongoDBError, "Collection '#{name}' already exists. (strict=true)"
       end
 
-      # Create a new collection.
-      oh = BSON::OrderedHash.new
-      oh[:create] = name
-      doc = command(oh.merge(opts || {}))
-      return Collection.new(name, self, :pk => @pk_factory) if ok?(doc)
+      begin
+        cmd = BSON::OrderedHash.new
+        cmd[:create] = name
+        doc = command(cmd.merge(opts || {}))
+        return Collection.new(name, self, :pk => @pk_factory) if ok?(doc)
+      rescue OperationFailure => e
+        return Collection.new(name, self, :pk => @pk_factory) if e.message =~ /exists/
+        raise e
+      end
       raise MongoDBError, "Error creating collection: #{doc.inspect}"
     end
 
@@ -305,11 +318,9 @@ module Mongo
     # @return [Mongo::Collection]
     def collection(name, opts={})
       if strict? && !collection_names.include?(name.to_s)
-        raise Mongo::MongoDBError, "Collection #{name} doesn't exist. " +
-          "Currently in strict mode."
+        raise MongoDBError, "Collection '#{name}' doesn't exist. (strict=true)"
       else
         opts = opts.dup
-        opts[:safe] = opts.fetch(:safe, @safe)
         opts.merge!(:pk => @pk_factory) unless opts[:pk]
         Collection.new(name, self, opts)
       end
@@ -322,9 +333,12 @@ module Mongo
     #
     # @return [Boolean] +true+ on success or +false+ if the collection name doesn't exist.
     def drop_collection(name)
-      return true unless collection_names.include?(name.to_s)
-
-      ok?(command(:drop => name))
+      return false if strict? && !collection_names.include?(name.to_s)
+      begin
+        ok?(command(:drop => name))
+      rescue OperationFailure => e
+        false
+      end
     end
 
     # Run the getlasterror command with the specified replication options.
@@ -332,6 +346,7 @@ module Mongo
     # @option opts [Boolean] :fsync (false)
     # @option opts [Integer] :w (nil)
     # @option opts [Integer] :wtimeout (nil)
+    # @option opts [Boolean] :j (false)
     #
     # @return [Hash] the entire response to getlasterror.
     #
@@ -341,7 +356,7 @@ module Mongo
       cmd[:getlasterror] = 1
       cmd.merge!(opts)
       doc = command(cmd, :check_response => false)
-      raise MongoDBError, "error retrieving last error: #{doc.inspect}" unless ok?(doc)
+      raise MongoDBError, "Error retrieving last error: #{doc.inspect}" unless ok?(doc)
       doc
     end
 
@@ -353,19 +368,15 @@ module Mongo
       get_last_error['err'] != nil
     end
 
-    # Get the most recent error to have occured on this database.
+    # Get the most recent error to have occurred on this database.
     #
-    # This command only returns errors that have occured since the last call to
+    # This command only returns errors that have occurred since the last call to
     # DB#reset_error_history - returns +nil+ if there is no such error.
     #
     # @return [String, Nil] the text of the error or +nil+ if no error has occurred.
     def previous_error
       error = command(:getpreverror => 1)
-      if error["err"]
-        error
-      else
-        nil
-      end
+      error["err"] ? error : nil
     end
 
     # Reset the error history of this database
@@ -392,19 +403,19 @@ module Mongo
     # Evaluate a JavaScript expression in MongoDB.
     #
     # @param [String, Code] code a JavaScript expression to evaluate server-side.
-    # @param [Integer, Hash] args any additional argument to be passed to the +code+ expression when 
+    # @param [Integer, Hash] args any additional argument to be passed to the +code+ expression when
     #   it's run on the server.
     #
     # @return [String] the return value of the function.
     def eval(code, *args)
-      if not code.is_a? BSON::Code
+      unless code.is_a?(BSON::Code)
         code = BSON::Code.new(code)
       end
 
-      oh = BSON::OrderedHash.new
-      oh[:$eval] = code
-      oh[:args]  = args
-      doc = command(oh)
+      cmd = BSON::OrderedHash.new
+      cmd[:$eval] = code
+      cmd[:args] = args
+      doc = command(cmd)
       doc['retval']
     end
 
@@ -417,10 +428,10 @@ module Mongo
     #
     # @raise MongoDBError if there's an error renaming the collection.
     def rename_collection(from, to)
-      oh = BSON::OrderedHash.new
-      oh[:renameCollection] = "#{@name}.#{from}"
-      oh[:to] = "#{@name}.#{to}"
-      doc = DB.new('admin', @connection).command(oh, :check_response => false)
+      cmd = BSON::OrderedHash.new
+      cmd[:renameCollection] = "#{@name}.#{from}"
+      cmd[:to] = "#{@name}.#{to}"
+      doc = DB.new('admin', @connection).command(cmd, :check_response => false)
       ok?(doc) || raise(MongoDBError, "Error renaming collection: #{doc.inspect}")
     end
 
@@ -432,12 +443,12 @@ module Mongo
     #
     # @return [True] returns +true+ on success.
     #
-    # @raise MongoDBError if there's an error renaming the collection.
+    # @raise MongoDBError if there's an error dropping the index.
     def drop_index(collection_name, index_name)
-      oh = BSON::OrderedHash.new
-      oh[:deleteIndexes] = collection_name
-      oh[:index] = index_name.to_s
-      doc = command(oh, :check_response => false)
+      cmd = BSON::OrderedHash.new
+      cmd[:deleteIndexes] = collection_name
+      cmd[:index] = index_name.to_s
+      doc = command(cmd, :check_response => false)
       ok?(doc) || raise(MongoDBError, "Error with drop_index command: #{doc.inspect}")
     end
 
@@ -446,7 +457,7 @@ module Mongo
     #
     # @param [String] collection_name
     #
-    # @return [Hash] keys are index names and the values are lists of [key, direction] pairs
+    # @return [Hash] keys are index names and the values are lists of [key, type] pairs
     #   defining the index.
     def index_information(collection_name)
       sel  = {:ns => full_collection_name(collection_name)}
@@ -487,30 +498,47 @@ module Mongo
     # hashes are ordered by default.
     #
     # @option opts [Boolean] :check_response (true) If +true+, raises an exception if the
-    # command fails.
+    #   command fails.
     # @option opts [Socket] :socket a socket to use for sending the command. This is mainly for internal use.
+    # @option opts [:primary, :secondary] :read Read preference for this command. See Collection#find for
+    #   more details.
+    # @option opts [String]  :comment (nil) a comment to include in profiling logs
     #
     # @return [Hash]
     #
     # @core commands command_instance-method
     def command(selector, opts={})
       check_response = opts.fetch(:check_response, true)
-      socket         = opts[:socket]
-      raise MongoArgumentError, "command must be given a selector" unless selector.is_a?(Hash) && !selector.empty?
+      socket = opts[:socket]
+      raise MongoArgumentError, "Command must be given a selector" unless selector.is_a?(Hash) && !selector.empty?
+
       if selector.keys.length > 1 && RUBY_VERSION < '1.9' && selector.class != BSON::OrderedHash
         raise MongoArgumentError, "DB#command requires an OrderedHash when hash contains multiple keys"
       end
 
+      if read_pref = opts[:read]
+        Mongo::ReadPreference::validate(read_pref)
+        unless read_pref == :primary || Mongo::Support::secondary_ok?(selector)
+          raise MongoArgumentError, "Command is not supported on secondaries: #{selector.keys.first}"
+        end
+      end
+
       begin
-        result = Cursor.new(system_command_collection,
-          :limit => -1, :selector => selector, :socket => socket).next_document
+        result = Cursor.new(
+          system_command_collection,
+          :limit => -1,
+          :selector => selector,
+          :socket => socket,
+          :read => read_pref,
+          :comment => opts[:comment]).next_document
       rescue OperationFailure => ex
         raise OperationFailure, "Database command '#{selector.keys.first}' failed: #{ex.message}"
       end
 
-      if result.nil?
-        raise OperationFailure, "Database command '#{selector.keys.first}' failed: returned null."
-      elsif (check_response && !ok?(result))
+      raise OperationFailure,
+        "Database command '#{selector.keys.first}' failed: returned null." unless result
+
+      if check_response && !ok?(result)
         message = "Database command '#{selector.keys.first}' failed: ("
         message << result.map do |key, value|
           "#{key}: '#{value}'"
@@ -518,9 +546,9 @@ module Mongo
         message << ').'
         code = result['code'] || result['assertionCode']
         raise OperationFailure.new(message, code, result)
-      else
-        result
       end
+
+      result
     end
 
     # A shortcut returning db plus dot plus collection name.
@@ -543,9 +571,8 @@ module Mongo
     #
     # @raise [MongoArgumentError] if the primary key factory has already been set.
     def pk_factory=(pk_factory)
-      if @pk_factory
-        raise MongoArgumentError, "Cannot change primary key factory once it's been set"
-      end
+      raise MongoArgumentError,
+        "Cannot change primary key factory once it's been set" if @pk_factory
 
       @pk_factory = pk_factory
     end
@@ -557,20 +584,15 @@ module Mongo
     #
     # @core profiling profiling_level-instance_method
     def profiling_level
-      oh = BSON::OrderedHash.new
-      oh[:profile] = -1
-      doc = command(oh, :check_response => false)
-      raise "Error with profile command: #{doc.inspect}" unless ok?(doc) && doc['was'].kind_of?(Numeric)
-      case doc['was'].to_i
-      when 0
-        :off
-      when 1
-        :slow_only
-      when 2
-        :all
-      else
-        raise "Error: illegal profiling level value #{doc['was']}"
-      end
+      cmd = BSON::OrderedHash.new
+      cmd[:profile] = -1
+      doc = command(cmd, :check_response => false)
+
+      raise "Error with profile command: #{doc.inspect}" unless ok?(doc)
+
+      level_sym = PROFILE_LEVEL.invert[doc['was'].to_i]
+      raise "Error: illegal profiling level value #{doc['was']}" unless level_sym
+      level_sym
     end
 
     # Set this database's profiling level. If profiling is enabled, you can
@@ -578,18 +600,9 @@ module Mongo
     #
     # @param [Symbol] level acceptable options are +:off+, +:slow_only+, or +:all+.
     def profiling_level=(level)
-      oh = BSON::OrderedHash.new
-      oh[:profile] = case level
-                     when :off
-                       0
-                     when :slow_only
-                       1
-                     when :all
-                       2
-                     else
-                       raise "Error: illegal profiling level value #{level}"
-                     end
-      doc = command(oh, :check_response => false)
+      cmd = BSON::OrderedHash.new
+      cmd[:profile] = PROFILE_LEVEL[level]
+      doc = command(cmd, :check_response => false)
       ok?(doc) || raise(MongoDBError, "Error with profile command: #{doc.inspect}")
     end
 
@@ -613,20 +626,13 @@ module Mongo
       cmd[:validate] = name
       cmd[:full] = true
       doc = command(cmd, :check_response => false)
-      if !ok?(doc)
-        raise MongoDBError, "Error with validate command: #{doc.inspect}"
-      end
+
+      raise MongoDBError, "Error with validate command: #{doc.inspect}" unless ok?(doc)
+
       if (doc.has_key?('valid') && !doc['valid']) || (doc['result'] =~ /\b(exception|corrupt)\b/i)
         raise MongoDBError, "Error: invalid collection #{name}: #{doc.inspect}"
       end
       doc
-    end
-
-    # The value of the read preference. This will be
-    # either +:primary+, +:secondary+, or an object
-    # representing the tags to be read from.
-    def read_preference
-      @read_preference
     end
 
     private
